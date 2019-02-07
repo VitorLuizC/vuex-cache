@@ -1,95 +1,149 @@
-const isVuexStore = obj =>
-  'dispatch' in obj && typeof obj.dispatch === 'function'
+// @ts-check
 
-// convert string or obj to string
-const toString = arg => (typeof arg === 'string' ? arg : JSON.stringify(arg))
+/**
+ * Store with cache property.
+ * @typedef {{ dispatch: import('vuex').Dispatch }} Store
+ */
 
-// convert arguments to string
-const argsToString = args => {
-  let type = toString(args[0])
-  if (args[1]) {
-    type = `${type}:${toString(args[1])}`
-  }
-  return type
+/**
+ * Check if value is a Store.
+ * @param {any} value
+ * @returns {value is Store}
+ */
+const isVuexStore = value => value && typeof value.dispatch === 'function'
+
+/**
+ * Convert value to `string`.
+ * @param {any} value
+ * @returns {string}
+ */
+const toString = value => typeof value === 'string' ? value : JSON.stringify(value)
+
+/**
+ * Dispatch parameters.
+ * @typedef {[string, any, { timeout?: number }] | [{ type: string, timeout?: number }]} DispatchParams
+ */
+
+/**
+ * Convert Dispatch parameters to key (`string`).
+ * @param {DispatchParams} params
+ * @returns {string}
+ */
+const toKey = params => {
+  const type = toString(params[0])
+  return params[1] ? type + ':' + toString(params[1]) : type
 }
 
-// parse timeout prop in option
-const getTimeout = (args, option) => {
-  if (args.length === 1 && args[0].timeout) {
-    return args[0].timeout
+/**
+ * Check if timeout property is defined on value.
+ * @param {any} value
+ * @returns {boolean}
+ */
+const isTimeoutDefined = (value) => value && 'timeout' in value
+
+/**
+ * Resolve timeout option from Dispatch parameters and Options.
+ * @param {DispatchParams} params
+ * @param {object} options
+ * @returns {number}
+ */
+const resolveTimeout = (params, options) => {
+  if (params.length === 1 && isTimeoutDefined(params[0])) {
+    return params[0].timeout
   }
-  if (args.length === 3 && args[2].timeout) {
-    return args[2].timeout
+  if (params.length === 3 && isTimeoutDefined(params[2])) {
+    return params[2].timeout
   }
-  if (option && option.timeout) {
-    return option.timeout
+  if (isTimeoutDefined(options)) {
+    return options.timeout
   }
   return 0
 }
 
-const cachePlugin = (store, option) => {
+/**
+ * Install cache on Store.
+ * @param {Store} store
+ * @param {object} [options]
+ */
+const setupCache = (store, options = {}) => {
+  /**
+   * Cache instance.
+   * @type {Map<string, { value: Promise<any>, expiresIn?: number }>}
+   */
   const cache = new Map()
-  // use another map to store timeout for each type
-  const timeoutCache = new Map()
 
-  cache.dispatch = (...args) => {
-    const type = argsToString(args)
+  store.cache = {
+    /**
+     * Dispatch an action an save it on cache.
+     * @type {(...params: DispatchParams) => Promise<void>}
+     */
+    dispatch: (...params) => {
+      const key = toKey(params)
+      const timeout = resolveTimeout(params, options)
 
-    const timeout = getTimeout(args, option)
-    if (timeout) {
-      const now = Date.now()
-      if (!timeoutCache.has(type)) {
-        timeoutCache.set(type, now)
-      } else {
-        const timeoutOfCurrentType = timeoutCache.get(type)
-        // console.log(now - timeout, timeoutOfCurrentType)
-        if (now - timeout > timeoutOfCurrentType) {
-          cache.delete(type)
-          timeoutCache.delete(type)
+      if (cache.has(key)) {
+        const { expiresIn } = cache.get(key)
+
+        if (expiresIn && Date.now() > expiresIn) {
+          cache.delete(key)
         }
       }
-    }
 
-    if (!cache.has(type)) {
-      const action = store.dispatch.apply(store, args).catch(error => {
-        cache.delete(type)
-        return Promise.reject(error)
-      })
+      if (!cache.has(key)) {
+        const value = store.dispatch.apply(store, params).catch(error => {
+          cache.delete(key)
+          return Promise.reject(error)
+        })
 
-      cache.set(type, action)
-    }
-    return cache.get(type)
+        cache.set(key, {
+          value,
+          expiresIn: timeout ? Date.now() + timeout : undefined
+        })
+      }
+
+      const { value } = cache.get(key)
+      return value
+    },
+
+    /**
+     * Check if cache has action.
+     * @type {(...params: DispatchParams) => boolean}
+     */
+    has: (...params) => cache.has(toKey(params)),
+
+    /**
+     * Clear cache.
+     */
+    clear: () => cache.clear(),
+
+    /**
+     * Delete action from cache.
+     * @type {(...params: DispatchParams) => boolean}
+     */
+    delete: (...params) => cache.delete(toKey(params))
   }
-
-  const _has = cache.has.bind(cache)
-  cache.has = (...args) => {
-    const key = argsToString(args)
-    return _has(toString(key))
-  }
-
-  const _delete = cache.delete.bind(cache)
-  cache.delete = (...args) => {
-    const key = argsToString(args)
-    return _delete(toString(key))
-  }
-
-  store.cache = cache
 }
 
-const resolveParams = args => {
-  if (!isVuexStore(args)) {
-    return store => cachePlugin(store, args)
+/**
+ * Resolve install cache.
+ * @param {object | Store} storeOrOptions
+ * @returns {void | ((store: Store) => void)}
+ */
+const resolveInstallCache = storeOrOptions => {
+  if (!isVuexStore(storeOrOptions)) {
+    return store => setupCache(store, storeOrOptions)
   }
-  return cachePlugin(args)
+  return setupCache(storeOrOptions)
 }
 
-// expose plugin as default
-export default resolveParams
+export default resolveInstallCache
 
-// expose action enhancer
-export function cacheAction(action) {
-  return function cacheEnhancedAction(context, payload) {
-    cachePlugin(context)
-    return action(context, payload)
-  }
+/**
+ * Cache an action.
+ * @param {import('vuex').Action<any, any>} action
+ * @return {import('vuex').Action<any, any>}
+ */
+export const cacheAction = action => (context, payload) => {
+  setupCache(context)
+  return action(context, payload)
 }
